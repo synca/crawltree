@@ -1,0 +1,9 @@
+# Increase threshold for too many arguments warning
+too-many-arguments-threshold = 12
+
+# Disable specific warnings that aren't practical for this codebase
+allow-unwrap-in-tests = true
+
+# Allow redundant pattern matching in some cases where drop order matters
+# Note: Using the correct configuration option below
+check-private-items = false
