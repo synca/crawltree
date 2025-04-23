@@ -123,8 +123,9 @@ jobs:
         verbose: true
 
     - name: Archive code coverage results
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
+        token: ${{ secrets.CODECOV_TOKEN }}
         name: code-coverage-report
         path: coverage/
         retention-days: 7
