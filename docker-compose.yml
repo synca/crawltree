@@ -4,6 +4,10 @@ services:
     ports:
     - 4444:4444
 
-  crawltree:
+  yield-page:
     build:
       context: .
+    environment:
+      RUST_LOG: ${RUST_LOG:-yield_page=debug}
+      WEBDRIVER_URL: http://webdriver:4444
+    command: cargo run https://www.envoyproxy.io/docs/envoy/latest/start/quick-start/

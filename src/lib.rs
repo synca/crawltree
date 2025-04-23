@@ -1,178 +1,135 @@
-use fantoccini::{Client, ClientBuilder};
-use scraper::{Html, Selector};
-use serde::Serialize;
-use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use tokio::time::timeout;
-use url::Url;
+#![allow(clippy::too_many_arguments)]
 
-#[derive(Serialize, Debug, Clone)]
-pub struct PageData {
-    pub url: String,
-    pub content: String,
-    pub links: Vec<String>,
+// Re-export modules
+pub mod config;
+pub mod crawlers;
+pub mod filter;
+pub mod parsers;
+pub mod results;
+pub mod utils;
+
+// Re-export commonly used types for convenience
+pub use results::PageData;
+
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+/// Types of URIs that can be crawled
+#[derive(Debug, Clone)]
+pub enum UriType {
+    /// Web URLs
+    Web(String),
+    /// Git repositories
+    Git(String),
+    /// Local filesystem
+    Filesystem(String),
+    /// Amazon S3 bucket
+    S3(String, String), // Bucket name, region
 }
 
-/// Starts an async crawl and returns a receiver that yields PageData as discovered.
-pub async fn start_crawler(start_url: &str, max_concurrency: usize) -> mpsc::Receiver<PageData> {
-    println!("Starting crawler for: {}", start_url);
+/// Main builder for page generation from different URI types
+pub struct Pages {
+    uri_type: UriType,
+    max_concurrency: usize,
+    idle_timeout: Option<Duration>,
+    total_timeout: Option<Duration>,
+}
 
-    let root_url = Url::parse(start_url).expect("Invalid start URL");
-    let root_domain = root_url.domain().unwrap().to_string();
-    let root_path = root_url.path().to_string();
-
-    let (crawl_tx, mut crawl_rx) = mpsc::channel::<String>(10000);
-    let (result_tx, result_rx) = mpsc::channel::<PageData>(10000);
-
-    let visited = Arc::new(Mutex::new(HashSet::new()));
-    crawl_tx.send(start_url.to_string()).await.unwrap();
-
-    let crawl_rx = Arc::new(Mutex::new(crawl_rx));
-
-    // Create a single WebDriver client to be shared among workers
-    let client_builder = ClientBuilder::native();
-    let client = client_builder
-        .connect("http://webdriver:4444/")
-        .await
-        .expect("Failed to connect to WebDriver");
-    let client = Arc::new(client);
-
-    for i in 0..max_concurrency {
-        let crawl_rx = Arc::clone(&crawl_rx);
-        let crawl_tx = crawl_tx.clone();
-        let result_tx = result_tx.clone();
-        let visited = Arc::clone(&visited);
-        let root_domain = root_domain.clone();
-        let root_path = root_path.clone();
-        let client = Arc::clone(&client);
-
-        println!("Spawning worker {}", i);
-        tokio::spawn(async move {
-
-            while let Some(url) = {
-                let mut rx = crawl_rx.lock().await;
-                rx.recv().await
-            } {
-                println!("Worker {} processing: {}", i, url);
-                {
-                    let mut seen = visited.lock().await;
-                    if seen.contains(&url) {
-                        println!("Worker {} skipping already visited: {}", i, url);
-                        continue;
-                    }
-                    seen.insert(url.clone());
-                }
-
-                if let Some(page) = scrape(&client, &url).await {
-                    if let Err(e) = result_tx.send(page.clone()).await {
-                        eprintln!("Worker {} failed to send result: {}", i, e);
-                        break;
-                    }
-
-                    for link in page.links {
-                        if let Ok(resolved) = Url::parse(&url).and_then(|base| base.join(&link)) {
-                            let skip_exts =
-                                ["pdf", "jpg", "jpeg", "png", "gif", "css", "js", "ico"];
-                            if skip_exts.iter().any(|ext| resolved.path().ends_with(ext)) {
-                                continue;
-                            }
-
-                            // Check domain first
-                            if let Some(domain) = resolved.domain() {
-                                if domain != root_domain {
-                                    continue;
-                                }
-                            }
-                            
-                            // Check if URL is within our allowed path
-                            if !resolved.path().starts_with(&root_path) {
-                                continue;
-                            }
-                            let mut normalized = resolved.clone();
-                            normalized.set_fragment(None);
-                            let link_str = normalized.to_string();
-
-                            let should_send = {
-                                let seen = visited.lock().await;
-                                !seen.contains(&link_str)
-                            };
-                            if should_send {
-                                println!("TX: {}", link_str);
-                                if let Err(e) = crawl_tx.send(link_str).await {
-                                    eprintln!("Worker {} failed to send link: {}", i, e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Remove individual client close
-            println!("Worker {} shutting down", i);
-        });
+impl Pages {
+    /// Create a new Pages builder with the given URI type
+    pub fn new(uri_type: UriType) -> Self {
+        Self {
+            uri_type,
+            max_concurrency: 4, // Default concurrency
+            idle_timeout: None,
+            total_timeout: None,
+        }
     }
 
-    // Drop the original sender to signal when all workers are done
-    drop(crawl_tx);
-    
-    // Spawn a cleanup task to close the client when all workers are done
-    let client_cleanup = Arc::clone(&client);
-    tokio::spawn(async move {
-        // Wait a bit to ensure all workers have started
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        
-        // Wait for all workers to finish by checking if the client is the only reference
-        while Arc::strong_count(&client_cleanup) > 1 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    /// Set the maximum number of concurrent crawlers
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.max_concurrency = max_concurrency;
+        self
+    }
+
+    /// Set the idle timeout (crawler stops if no new pages for this duration)
+    pub fn with_idle_timeout(mut self, timeout_seconds: u64) -> Self {
+        self.idle_timeout = Some(Duration::from_secs(timeout_seconds));
+        self
+    }
+
+    /// Set the total timeout (maximum runtime)
+    pub fn with_total_timeout(mut self, timeout_seconds: u64) -> Self {
+        self.total_timeout = Some(Duration::from_secs(timeout_seconds));
+        self
+    }
+
+    /// Set the configuration from a CrawlerConfigType
+    pub fn with_config(mut self, config: config::CrawlerConfigType) -> Self {
+        // Configure the builder based on the provided configuration
+        match &config {
+            config::CrawlerConfigType::Web(web_config) => {
+                self.max_concurrency = web_config.max_concurrency;
+            }
+            config::CrawlerConfigType::Git(_) => {
+                // Set Git-specific options
+            }
+            config::CrawlerConfigType::Filesystem(_) => {
+                // Set Filesystem-specific options
+            }
+            config::CrawlerConfigType::S3(_) => {
+                // Set S3-specific options
+            }
         }
-        
-        // Now close the client
-        if let Ok(client) = Arc::try_unwrap(client_cleanup) {
-            client.close().await.ok();
-            println!("WebDriver client closed");
-        }
-    });
-    
-    result_rx
-}
+        self
+    }
 
-async fn scrape(client: &Client, url: &str) -> Option<PageData> {
-    println!("SCRAPE: {}", url);
-    
-    // Add timeout for the entire scrape operation
-    let scrape_result = timeout(tokio::time::Duration::from_secs(30), async {
-        client.goto(url).await.ok()?;
-        let html = client.source().await.ok()?;
-        let doc = Html::parse_document(&html);
+    /// Load configuration from a file
+    pub fn with_config_file(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = config::CrawlerConfigType::from_file(path)?;
+        Ok(self.with_config(config))
+    }
 
-        let content_selector = Selector::parse("body").unwrap();
-        let text = doc
-            .select(&content_selector)
-            .flat_map(|n| n.text())
-            .collect::<Vec<_>>()
-            .join(" ");
+    /// Load configuration from a string
+    pub fn with_config_str(self, config_str: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = serde_json::from_str(config_str)?;
+        Ok(self.with_config(config))
+    }
 
-        let link_selector = Selector::parse("a").unwrap();
-        let links = doc
-            .select(&link_selector)
-            .filter_map(|e| e.value().attr("href"))
-            .map(|s| s.to_string())
-            .collect();
+    /// Start the crawler and get a receiver for pages
+    pub async fn generate(self) -> Result<mpsc::Receiver<PageData>, Box<dyn std::error::Error>> {
+        match self.uri_type {
+            UriType::Web(url_str) => {
+                // Create web crawler configuration
+                let mut web_config = config::WebCrawlerConfig::new(&url_str);
+                web_config.max_concurrency = self.max_concurrency;
 
-        Some(PageData {
-            url: url.to_string(),
-            content: text,
-            links,
-        })
-    }).await;
-    
-    match scrape_result {
-        Ok(result) => result,
-        Err(_) => {
-            eprintln!("Timeout scraping: {}", url);
-            None
+                // Override the WebDriver URL with an environment variable if provided
+                if let Ok(webdriver_url) = std::env::var("WEBDRIVER_URL") {
+                    if !webdriver_url.is_empty() {
+                        web_config.webdriver_url = webdriver_url;
+                    }
+                }
+
+                // Start the web crawler
+                let receiver = crawlers::web::start(&web_config).await;
+                Ok(receiver)
+            }
+            UriType::Git(_) => {
+                // Placeholder for Git implementation
+                unimplemented!("Git crawler not yet implemented")
+            }
+            UriType::Filesystem(_) => {
+                // Placeholder for Filesystem implementation
+                unimplemented!("Filesystem crawler not yet implemented")
+            }
+            UriType::S3(_, _) => {
+                // Placeholder for S3 implementation
+                unimplemented!("S3 crawler not yet implemented")
+            }
         }
     }
 }

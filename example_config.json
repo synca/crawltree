@@ -1,0 +1,20 @@
+{
+    "type": "web",
+    "start_url": "https://example.com",
+    "max_concurrency": 4,
+    "idle_timeout_secs": 300,
+    "total_timeout_secs": 3600,
+    "allow_external": false,
+    "user_agent": "yield-page/1.0",
+    "webdriver_url": "http://webdriver:4444",
+    "exclude_patterns": [
+        "\\.jpg$",
+        "\\.svg$",
+        "/assets/",
+        "/static/"
+    ],
+    "include_patterns": [
+        "/blog/",
+        "/docs/"
+    ]
+}
